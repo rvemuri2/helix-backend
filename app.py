@@ -13,10 +13,12 @@ app = Flask(__name__)
 app.url_map.strict_slashes = False
 CORS(app)
 
+
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///helix_database.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 from flask_sqlalchemy import SQLAlchemy
 db = SQLAlchemy(app)
+
 
 class User(db.Model):
     id = db.Column(db.String, primary_key=True)  
@@ -93,7 +95,7 @@ function_definitions = [
 
 def load_db_conversation(user_id):
     """Load conversation history from the DB and prepend the system prompt.
-       Map our 'ai' sender to the 'assistant' role for OpenAI context."""
+       Map 'ai' messages to 'assistant' for OpenAI context."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     chats = ChatMessage.query.filter_by(user_id=user_id).order_by(ChatMessage.created_at).all()
     for msg in chats:
@@ -103,31 +105,39 @@ def load_db_conversation(user_id):
 
 def classify_intent(user_input):
     """
-    Use OpenAI to classify the user's intent into one of:
-    - "add_step": add a new step to the existing sequence.
-    - "edit_step": edit an existing step.
-    - "new_sequence": generate an entirely new sequence.
+    Classify the user's intent based on phrasing.
+    
+    - If the input contains a pattern like "step <number> should/needs/must/would/talk about/include", return "edit_step".
+    - If it contains phrases like "add step", "create step", "new step", or "another step", return "add_step".
+    - Otherwise, return "new_sequence".
     """
-    prompt = (
-        "Classify the following user request into one of three categories: 'add_step', 'edit_step', or 'new_sequence'.\n"
-        "If the user is requesting to add a new step to an existing sequence, return add_step.\n"
-        "If the user is requesting to edit an existing step, return edit_step.\n"
-        "If the user is requesting to generate an entirely new sequence, return new_sequence.\n"
-        "User request: " + user_input + "\n"
-        "Return only one of the words: add_step, edit_step, or new_sequence."
-    )
-    try:
-        classification_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "system", "content": prompt}],
-            temperature=0
-        )
-        intent = classification_response.choices[0].message.content.strip().lower()
-        if intent in ["add_step", "edit_step", "new_sequence"]:
-            return intent
-    except Exception as e:
-        print("Classification error:", e)
-    return "new_sequence"  
+    lower_input = user_input.lower()
+    if re.search(r"step\s+\d+\s+(should|needs|must|would|talk about|include)", lower_input):
+        return "edit_step"
+    if any(phrase in lower_input for phrase in ["add step", "create step", "new step", "another step"]):
+        return "add_step"
+    return "new_sequence"
+
+@app.route("/api/sequence/update", methods=["PUT"])
+def update_sequence():
+    data = request.get_json()
+    sequence_id = data.get("sequenceId")
+    step_number = data.get("stepNumber")
+    field = data.get("field")
+    value = data.get("value")
+    if not sequence_id or not step_number or not field:
+        return jsonify({"error": "Missing required parameters."}), 400
+    step = SequenceStep.query.filter_by(sequence_id=sequence_id, step_number=step_number).first()
+    if not step:
+        return jsonify({"error": "Step not found."}), 404
+    if field == "stepTitle":
+        step.title = value
+    elif field == "stepContent":
+        step.content = value
+    else:
+        return jsonify({"error": "Invalid field."}), 400
+    db.session.commit()
+    return jsonify({"message": "Step updated."}), 200
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -151,11 +161,10 @@ def chat():
     db.session.add(user_msg)
     db.session.commit()
 
-    
+   
     intent = classify_intent(user_input)
     print("Classified intent:", intent)
 
-    
     active_sequence = Sequence.query.filter_by(user_id=user_id).order_by(Sequence.created_at.desc()).first()
 
     if intent == "add_step":
@@ -175,11 +184,12 @@ def chat():
             {"role": "user", "content": user_input},
         ]
         try:
-            response = client.chat.completions.create(model="gpt-4o", messages=messages_to_send, temperature=0.7)
+            response = client.chat.completions.create(
+                model="gpt-4o", messages=messages_to_send, temperature=0.7
+            )
         except Exception as e:
             print("OpenAI API Error:", e)
             return jsonify({"reply": "Error calling OpenAI API", "sequence": []}), 500
-
         ai_output = response.choices[0].message.content.strip()
         if ai_output.startswith("```json"):
             ai_output = ai_output[len("```json"):].strip()
@@ -219,39 +229,55 @@ def chat():
         target_step = SequenceStep.query.filter_by(sequence_id=active_sequence.id, step_number=target_num).first()
         if not target_step:
             return jsonify({"reply": f"Step {target_num} not found.", "sequence": []}), 404
-
+        # Build context including full sequence.
+        existing_steps = SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
+        context_str = "\n".join([f"Step {s.step_number}: {s.title} - {s.content}" for s in existing_steps])
         prompt = (
-            f"You are Helix, an AI assistant. Your task is to update ONLY the content of step {target_num} in the current sequence. "
-            f"Keep the step title '{target_step.title}' unchanged. "
-            "Based on the following user request, provide the revised version of the step content as plain text. "
-            "Do not include the step number or step title in your response. "
-            "If you need clarification, include the word 'clarify' in your response."
+            f"You are Helix, a friendly AI assistant. The current sequence is:\n{context_str}\n"
+            f"Your task is to update the content of step {target_num} (currently titled '{target_step.title}') so that it fits naturally with the rest of the sequence in a warm, human tone. "
+            "Incorporate the following user request into the revised content: " + user_input + "\n"
+            "Return only the final revised version of the step content as a single paragraph without any step number, title, or markdown formatting. "
+            "If a new title is warranted, output the new title on the first line (without markdown symbols), followed by the revised content on the next line."
         )
-        messages_to_send = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": user_input},
-        ]
+        messages_to_send = [{"role": "system", "content": prompt}]
         try:
-            response = client.chat.completions.create(model="gpt-4o", messages=messages_to_send, temperature=0.7)
+            response = client.chat.completions.create(
+                model="gpt-4o", messages=messages_to_send, temperature=0.7
+            )
         except Exception as e:
             print("OpenAI API Error:", e)
             return jsonify({"reply": "Error calling OpenAI API for step edit", "sequence": []}), 500
         ai_response = response.choices[0].message.content.strip()
-        
         if "clarify" in ai_response.lower():
             clar_msg = ChatMessage(user_id=user_id, message=ai_response, sender="ai")
             db.session.add(clar_msg)
             db.session.commit()
             updated_steps = [
                 {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
-                for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
+                for s in existing_steps
             ]
-            return jsonify({"reply": ai_response, "sequence": updated_steps, "sequenceId": active_sequence.id})
+            return jsonify({
+                "reply": ai_response,
+                "intent": "clarification",
+                "sequence": updated_steps,
+                "sequenceId": active_sequence.id
+            })
         else:
+            if "\n" in ai_response:
+                parts = ai_response.split("\n", 1)
+                proposed_title = parts[0].strip()
+                proposed_content = parts[1].strip()
+                new_title = proposed_title if proposed_title.lower() != target_step.title.lower() else target_step.title
+                final_revision = proposed_content
+            else:
+                new_title = target_step.title
+                final_revision = ai_response
             
             pattern = r"^" + re.escape(target_step.title) + r"[\s:\-]*"
-            final_revision = re.sub(pattern, "", ai_response)
+            final_revision = re.sub(pattern, "", final_revision).strip()
+            target_step.title = new_title
             target_step.content = final_revision
+            db.session.add(target_step)
             db.session.commit()
             updated_steps = [
                 {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
@@ -332,6 +358,9 @@ def load_history():
         {"sender": msg.sender, "message": msg.message, "timestamp": msg.created_at.isoformat()}
         for msg in chats
     ]
+    if not chat_history or (chat_history[0]["sender"] != "ai" or chat_history[0]["message"] != "How can I help you?"):
+        default_intro = {"sender": "ai", "message": "How can I help you?", "timestamp": datetime.utcnow().isoformat()}
+        chat_history.insert(0, default_intro)
     sequences = Sequence.query.filter_by(user_id=user_id).order_by(Sequence.created_at.asc()).all()
     sequences_data = []
     for seq in sequences:
