@@ -10,19 +10,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-
 app.url_map.strict_slashes = False
 CORS(app)
-
 
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///helix_database.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 from flask_sqlalchemy import SQLAlchemy
 db = SQLAlchemy(app)
 
-
 class User(db.Model):
-    id = db.Column(db.String, primary_key=True) 
+    id = db.Column(db.String, primary_key=True)  
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Sequence(db.Model):
@@ -52,8 +49,10 @@ class ChatMessage(db.Model):
 with app.app_context():
     db.create_all()
 
+
 client = openai.OpenAI()
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
 
 SYSTEM_PROMPT = (
     "You are Helix, an AI assistant that generates fully personalized and actionable multi-step sequences for sales, outreach, or letters. "
@@ -94,13 +93,41 @@ function_definitions = [
 
 def load_db_conversation(user_id):
     """Load conversation history from the DB and prepend the system prompt.
-       Map our 'ai' sender to 'assistant' role for OpenAI context."""
+       Map our 'ai' sender to the 'assistant' role for OpenAI context."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     chats = ChatMessage.query.filter_by(user_id=user_id).order_by(ChatMessage.created_at).all()
     for msg in chats:
         role = "assistant" if msg.sender == "ai" else "user"
         messages.append({"role": role, "content": msg.message})
     return messages
+
+def classify_intent(user_input):
+    """
+    Use OpenAI to classify the user's intent into one of:
+    - "add_step": add a new step to the existing sequence.
+    - "edit_step": edit an existing step.
+    - "new_sequence": generate an entirely new sequence.
+    """
+    prompt = (
+        "Classify the following user request into one of three categories: 'add_step', 'edit_step', or 'new_sequence'.\n"
+        "If the user is requesting to add a new step to an existing sequence, return add_step.\n"
+        "If the user is requesting to edit an existing step, return edit_step.\n"
+        "If the user is requesting to generate an entirely new sequence, return new_sequence.\n"
+        "User request: " + user_input + "\n"
+        "Return only one of the words: add_step, edit_step, or new_sequence."
+    )
+    try:
+        classification_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0
+        )
+        intent = classification_response.choices[0].message.content.strip().lower()
+        if intent in ["add_step", "edit_step", "new_sequence"]:
+            return intent
+    except Exception as e:
+        print("Classification error:", e)
+    return "new_sequence"  
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -124,18 +151,24 @@ def chat():
     db.session.add(user_msg)
     db.session.commit()
 
-    active_sequence = Sequence.query.filter_by(user_id=user_id).order_by(Sequence.created_at.desc()).first()
-    processed = False
+    
+    intent = classify_intent(user_input)
+    print("Classified intent:", intent)
 
     
-    if active_sequence and "add" in user_input.lower() and "step" in user_input.lower():
+    active_sequence = Sequence.query.filter_by(user_id=user_id).order_by(Sequence.created_at.desc()).first()
+
+    if intent == "add_step":
+        if not active_sequence:
+            return jsonify({"reply": "No active sequence to add a step to.", "sequence": []}), 400
         existing_steps = SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
-        steps_text = "\n".join([f"Step {s.step_number}: {s.title} - {s.content}" for s in existing_steps])
+        steps_text = "\n".join([f"{s.title} - {s.content}" for s in existing_steps])
         prompt = (
             "You are Helix, an AI assistant that appends a new step to an existing sequence. "
             "Do not modify any existing steps. The current sequence is:\n" +
             steps_text +
-            "\nBased on the following user request, generate one new step as a JSON object with keys 'step_title' and 'step_content'."
+            "\nBased on the following user request, generate one new step as a JSON object with keys 'step_title' and 'step_content'. "
+            "Ensure the style matches the existing steps."
         )
         messages_to_send = [
             {"role": "system", "content": prompt},
@@ -171,74 +204,66 @@ def chat():
             for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
         ]
         ai_reply = "New step added to the sequence."
-        
         conf_msg = ChatMessage(user_id=user_id, message=ai_reply, sender="ai")
         db.session.add(conf_msg)
         db.session.commit()
-        processed = True
         return jsonify({"reply": ai_reply, "sequence": updated_steps, "sequenceId": active_sequence.id})
 
-    
-    elif active_sequence and ("edit step" in user_input.lower() or "change step" in user_input.lower()):
-        match = re.search(r"(?:edit|change)\s+step\s+(\d+)", user_input.lower())
-        if match:
-            target_num = int(match.group(1))
-            target_step = SequenceStep.query.filter_by(sequence_id=active_sequence.id, step_number=target_num).first()
-            if not target_step:
-                return jsonify({"reply": f"Step {target_num} not found.", "sequence": []}), 404
+    elif intent == "edit_step":
+        if not active_sequence:
+            return jsonify({"reply": "No active sequence to edit.", "sequence": []}), 400
+        match = re.search(r"(\d+)", user_input)
+        if not match:
+            return jsonify({"reply": "Could not determine which step to edit.", "sequence": []}), 400
+        target_num = int(match.group(1))
+        target_step = SequenceStep.query.filter_by(sequence_id=active_sequence.id, step_number=target_num).first()
+        if not target_step:
+            return jsonify({"reply": f"Step {target_num} not found.", "sequence": []}), 404
 
-            prompt = (
-                f"You are Helix, an AI assistant. Your task is to update ONLY the content of step {target_num} in the current sequence. "
-                f"Keep the step title '{target_step.title}' unchanged. "
-                "Based on the following user request, provide the revised version of the step content as plain text. "
-                "If you need clarification, please include the word 'clarify' in your response."
-            )
-            messages_to_send = [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_input},
-            ]
-            try:
-                response = client.chat.completions.create(model="gpt-4o", messages=messages_to_send, temperature=0.7)
-            except Exception as e:
-                print("OpenAI API Error:", e)
-                return jsonify({"reply": "Error calling OpenAI API for step edit", "sequence": []}), 500
-
-            ai_response = response.choices[0].message.content.strip()
-
-            if "clarify" in ai_response.lower():
-                clar_msg = ChatMessage(user_id=user_id, message=ai_response, sender="ai")
-                db.session.add(clar_msg)
-                db.session.commit()
-                updated_steps = [
-                    {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
-                    for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
-                ]
-                return jsonify({"reply": ai_response, "sequence": updated_steps, "sequenceId": active_sequence.id})
-            else:
-                target_step.content = ai_response
-                db.session.commit()
-                updated_steps = [
-                    {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
-                    for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
-                ]
-                ai_confirm = f"Step {target_num} updated."
-                confirm_msg = ChatMessage(user_id=user_id, message=ai_confirm, sender="ai")
-                db.session.add(confirm_msg)
-                db.session.commit()
-                return jsonify({"reply": ai_confirm, "sequence": updated_steps, "sequenceId": active_sequence.id})
-
-    if active_sequence:
-        updated_steps = [
-            {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
-            for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
+        prompt = (
+            f"You are Helix, an AI assistant. Your task is to update ONLY the content of step {target_num} in the current sequence. "
+            f"Keep the step title '{target_step.title}' unchanged. "
+            "Based on the following user request, provide the revised version of the step content as plain text. "
+            "Do not include the step number or step title in your response. "
+            "If you need clarification, include the word 'clarify' in your response."
+        )
+        messages_to_send = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_input},
         ]
-        ai_confirm = "Active sequence loaded."
-        confirm_msg = ChatMessage(user_id=user_id, message=ai_confirm, sender="ai")
-        db.session.add(confirm_msg)
-        db.session.commit()
-        return jsonify({"reply": ai_confirm, "sequence": updated_steps, "sequenceId": active_sequence.id})
-    else:
+        try:
+            response = client.chat.completions.create(model="gpt-4o", messages=messages_to_send, temperature=0.7)
+        except Exception as e:
+            print("OpenAI API Error:", e)
+            return jsonify({"reply": "Error calling OpenAI API for step edit", "sequence": []}), 500
+        ai_response = response.choices[0].message.content.strip()
         
+        if "clarify" in ai_response.lower():
+            clar_msg = ChatMessage(user_id=user_id, message=ai_response, sender="ai")
+            db.session.add(clar_msg)
+            db.session.commit()
+            updated_steps = [
+                {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
+                for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
+            ]
+            return jsonify({"reply": ai_response, "sequence": updated_steps, "sequenceId": active_sequence.id})
+        else:
+            
+            pattern = r"^" + re.escape(target_step.title) + r"[\s:\-]*"
+            final_revision = re.sub(pattern, "", ai_response)
+            target_step.content = final_revision
+            db.session.commit()
+            updated_steps = [
+                {"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content}
+                for s in SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
+            ]
+            ai_confirm = f"Step {target_num} updated."
+            confirm_msg = ChatMessage(user_id=user_id, message=ai_confirm, sender="ai")
+            db.session.add(confirm_msg)
+            db.session.commit()
+            return jsonify({"reply": ai_confirm, "sequence": updated_steps, "sequenceId": active_sequence.id})
+
+    elif intent == "new_sequence":
         db_history = load_db_conversation(user_id)
         try:
             response = client.chat.completions.create(
@@ -251,7 +276,6 @@ def chat():
         except Exception as e:
             print("OpenAI API Error:", e)
             return jsonify({"reply": "Error calling OpenAI API", "sequence": []}), 500
-
         choice = response.choices[0]
         if choice.finish_reason == "function_call":
             fn_name = choice.message.function_call.name
@@ -295,6 +319,8 @@ def chat():
             db.session.add(ai_msg)
             db.session.commit()
             return jsonify({"reply": ai_reply, "sequence": []})
+    else:
+        return jsonify({"reply": "Unable to classify request. Please try again.", "sequence": []})
 
 @app.route("/api/load", methods=["GET"])
 def load_history():
@@ -302,7 +328,6 @@ def load_history():
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
     chats = ChatMessage.query.filter_by(user_id=user_id).order_by(ChatMessage.created_at.asc()).all()
-    
     chat_history = [
         {"sender": msg.sender, "message": msg.message, "timestamp": msg.created_at.isoformat()}
         for msg in chats
