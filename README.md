@@ -15,3 +15,6 @@
 ## 7. run python seed.py (if there is no seed data generated)
 
 ## 8. run python run.py
+
+
+## (Note: Have your own API key for OPENAI_API_KEY, if for some reason you cannot get one, please do let me know)
