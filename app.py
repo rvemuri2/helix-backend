@@ -22,6 +22,7 @@ class User(db.Model):
     id = db.Column(db.String, primary_key=True)  
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+
 class Sequence(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
@@ -29,6 +30,7 @@ class Sequence(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     steps = db.relationship("SequenceStep", backref="sequence", cascade="all, delete-orphan")
+
 
 class SequenceStep(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -39,12 +41,14 @@ class SequenceStep(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+
 class ChatMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
     message = db.Column(db.String)
-    sender = db.Column(db.String) 
+    sender = db.Column(db.String)  
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 
 with app.app_context():
     db.create_all()
@@ -52,7 +56,6 @@ with app.app_context():
 
 client = openai.OpenAI()
 openai.api_key = os.getenv("OPENAI_API_KEY")
-
 
 SYSTEM_PROMPT = (
     "You are Helix, an AI assistant that generates fully personalized and actionable multi-step sequences for sales, outreach, or letters. "
@@ -91,6 +94,7 @@ function_definitions = [
     }
 ]
 
+
 def load_db_conversation(user_id):
     """
     Load conversation history from the DB and prepend the system prompt.
@@ -103,36 +107,51 @@ def load_db_conversation(user_id):
         messages.append({"role": role, "content": msg.message})
     return messages
 
+
 def extract_step_number(user_input):
     """
-    Extract a step number from the user input, either as digits or ordinal words.
+    Extract a step number from the user input, supporting:
+      - Digit-based references: "step 3"
+      - Ordinal words: "the second step" or "step second"
+      - Keywords "last" or "final" (returns the string "last" as a sentinel)
+      - Keywords "intro" or "beginning" (returns 1)
     """
-    match = re.search(r"(\d+)", user_input)
+    lower_input = user_input.lower()
+    
+    if re.search(r"(last|final)\s+step", lower_input):
+        return "last"
+    
+    if re.search(r"(intro|beginning)\s+step", lower_input):
+        return 1
+    
+    match = re.search(r"(?:the\s+)?step\s+(\d+)", lower_input)
     if match:
         return int(match.group(1))
-    ordinals = {
-        "first": 1,
-        "second": 2,
-        "third": 3,
-        "fourth": 4,
-        "fifth": 5,
-        "sixth": 6,
-        "seventh": 7,
-        "eighth": 8,
-        "ninth": 9,
-        "tenth": 10
-    }
-    lower_input = user_input.lower()
-    for word, number in ordinals.items():
-        if f"step {word}" in lower_input:
-            return number
+   
+    ordinal_pattern = r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)"
+    match = re.search(r"(?:the\s+)?(" + ordinal_pattern + r")\s+step", lower_input)
+    if match:
+        ordinals = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10
+        }
+        return ordinals.get(match.group(1))
     return None
+
 
 def classify_intent(user_input):
     """
     Use GPT (via OpenAI's API) to classify the user's intent based on natural phrasing.
     
-    The prompt instructs the model to consider the full context of the user's phrasing and output one of:
+    The model is instructed to output exactly one of:
       - "add_step" if the user intends to add a new step,
       - "edit_step" if the user intends to modify an existing step,
       - "new_sequence" if a completely new sequence is desired.
@@ -158,7 +177,7 @@ def classify_intent(user_input):
             return intent
     except Exception as e:
         print("Classification error:", e)
-    return "new_sequence" 
+    return "new_sequence"
 
 @app.route("/api/classify", methods=["POST"])
 def classify():
@@ -204,6 +223,10 @@ def chat():
         user = User(id=user_id)
         db.session.add(user)
         db.session.commit()
+        
+        default_msg = ChatMessage(user_id=user_id, message="How can I help you?", sender="ai")
+        db.session.add(default_msg)
+        db.session.commit()
 
     user_input = data.get("message", "").strip()
     if not user_input:
@@ -214,7 +237,6 @@ def chat():
     db.session.add(user_msg)
     db.session.commit()
 
-    
     intent = classify_intent(user_input)
     print("Classified intent:", intent)
 
@@ -278,6 +300,13 @@ def chat():
         if not active_sequence:
             return jsonify({"reply": "No active sequence to edit.", "sequence": []}), 400
         target_num = extract_step_number(user_input)
+        
+        if target_num == "last":
+            existing_steps = SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number.desc()).all()
+            if existing_steps:
+                target_num = existing_steps[0].step_number
+            else:
+                return jsonify({"reply": "No steps available to edit.", "sequence": []}), 400
         if not target_num:
             return jsonify({"reply": "Could not determine which step to edit.", "sequence": []}), 400
         target_step = SequenceStep.query.filter_by(sequence_id=active_sequence.id, step_number=target_num).first()
@@ -324,8 +353,10 @@ def chat():
             else:
                 new_title = target_step.title
                 final_revision = ai_response
+
             pattern = r"^" + re.escape(target_step.title) + r"[\s:\-]*"
             final_revision = re.sub(pattern, "", final_revision).strip()
+
             target_step.title = new_title
             target_step.content = final_revision
             db.session.add(target_step)
@@ -402,6 +433,7 @@ def chat():
     else:
         return jsonify({"reply": "Unable to classify request. Please try again.", "sequence": []})
 
+
 @app.route("/api/load", methods=["GET"])
 def load_history():
     user_id = request.args.get("user_id")
@@ -427,17 +459,22 @@ def load_history():
     print(f"Loaded history for user {user_id}: {len(chat_history)} messages, {len(sequences_data)} sequences")
     return jsonify({"chat_history": chat_history, "sequences": sequences_data})
 
+
 @app.route("/api/delete_history", methods=["DELETE"])
 def delete_history():
     user_id = request.args.get("user_id")
     if not user_id:
         return jsonify({"error": "Missing user_id"}), 400
-    ChatMessage.query.filter_by(user_id=user_id).delete()
-    sequences = Sequence.query.filter_by(user_id=user_id).all()
-    for seq in sequences:
-        db.session.delete(seq)
+    ChatMessage.query.filter_by(user_id=user_id).delete(synchronize_session=False)
     db.session.commit()
-    return jsonify({"message": "History deleted"}), 200
+    default_msg = ChatMessage(user_id=user_id, message="How can I help you?", sender="ai")
+    db.session.add(default_msg)
+    db.session.commit()
+    return jsonify({
+        "message": "History deleted",
+        "default": {"sender": "ai", "message": "How can I help you?", "timestamp": default_msg.created_at.isoformat()}
+    }), 200
+
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
