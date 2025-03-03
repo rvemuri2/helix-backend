@@ -238,6 +238,7 @@ def chat():
     db.session.commit()
 
     intent = classify_intent(user_input)
+    print("Classified intent:", intent)
 
     active_sequence = Sequence.query.filter_by(user_id=user_id).order_by(Sequence.created_at.desc()).first()
 
@@ -455,34 +456,8 @@ def load_history():
             "title": seq.title,
             "steps": [{"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content} for s in steps]
         })
+    print(f"Loaded history for user {user_id}: {len(chat_history)} messages, {len(sequences_data)} sequences")
     return jsonify({"chat_history": chat_history, "sequences": sequences_data})
-
-
-@app.route("/api/delete_history", methods=["DELETE"])
-def delete_history():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "Missing user_id"}), 400
-
-    ChatMessage.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    
-    Sequence.query.filter_by(user_id=user_id).delete(synchronize_session=False)
-    
-    db.session.commit()
-
-    default_msg = ChatMessage(user_id=user_id, message="How can I help you?", sender="ai")
-    db.session.add(default_msg)
-    db.session.commit()
-
-    return jsonify({
-        "message": "History deleted",
-        "default": {
-            "sender": "ai",
-            "message": "How can I help you?",
-            "timestamp": default_msg.created_at.isoformat()
-        }
-    }), 200
-
 
 
 if __name__ == "__main__":
