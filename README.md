@@ -18,3 +18,6 @@
 
 
 ## (Note: Have your own API key for OPENAI_API_KEY, if for some reason you cannot get one, please do let me know)
+
+
+This will only run the backend server, you must run the frontend repo with this repo for the application to work
