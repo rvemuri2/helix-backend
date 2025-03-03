@@ -238,7 +238,6 @@ def chat():
     db.session.commit()
 
     intent = classify_intent(user_input)
-    print("Classified intent:", intent)
 
     active_sequence = Sequence.query.filter_by(user_id=user_id).order_by(Sequence.created_at.desc()).first()
 
@@ -456,7 +455,6 @@ def load_history():
             "title": seq.title,
             "steps": [{"stepNumber": s.step_number, "stepTitle": s.title, "stepContent": s.content} for s in steps]
         })
-    print(f"Loaded history for user {user_id}: {len(chat_history)} messages, {len(sequences_data)} sequences")
     return jsonify({"chat_history": chat_history, "sequences": sequences_data})
 
 
