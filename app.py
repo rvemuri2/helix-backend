@@ -18,11 +18,9 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 from flask_sqlalchemy import SQLAlchemy
 db = SQLAlchemy(app)
 
-
 class User(db.Model):
-    id = db.Column(db.String, primary_key=True) 
+    id = db.Column(db.String, primary_key=True)  
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
 
 class Sequence(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -31,7 +29,6 @@ class Sequence(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     steps = db.relationship("SequenceStep", backref="sequence", cascade="all, delete-orphan")
-
 
 class SequenceStep(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -42,18 +39,15 @@ class SequenceStep(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-
 class ChatMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
     message = db.Column(db.String)
-    sender = db.Column(db.String)  
+    sender = db.Column(db.String) 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
 
 with app.app_context():
     db.create_all()
-
 
 
 client = openai.OpenAI()
@@ -97,7 +91,6 @@ function_definitions = [
     }
 ]
 
-
 def load_db_conversation(user_id):
     """
     Load conversation history from the DB and prepend the system prompt.
@@ -109,7 +102,6 @@ def load_db_conversation(user_id):
         role = "assistant" if msg.sender == "ai" else "user"
         messages.append({"role": role, "content": msg.message})
     return messages
-
 
 def extract_step_number(user_input):
     """
@@ -135,7 +127,6 @@ def extract_step_number(user_input):
         if f"step {word}" in lower_input:
             return number
     return None
-
 
 def classify_intent(user_input):
     """
@@ -167,7 +158,16 @@ def classify_intent(user_input):
             return intent
     except Exception as e:
         print("Classification error:", e)
-    return "new_sequence"  
+    return "new_sequence" 
+
+@app.route("/api/classify", methods=["POST"])
+def classify():
+    data = request.get_json()
+    user_input = data.get("message", "").strip()
+    if not user_input:
+        return jsonify({"intent": "new_sequence"})
+    intent = classify_intent(user_input)
+    return jsonify({"intent": intent})
 
 
 @app.route("/api/sequence/update", methods=["PUT"])
@@ -284,7 +284,6 @@ def chat():
         if not target_step:
             return jsonify({"reply": f"Step {target_num} not found.", "sequence": []}), 404
 
-        
         existing_steps = SequenceStep.query.filter_by(sequence_id=active_sequence.id).order_by(SequenceStep.step_number).all()
         context_str = "\n".join([f"Step {s.step_number}: {s.title} - {s.content}" for s in existing_steps])
         prompt = (
@@ -306,7 +305,6 @@ def chat():
             print("OpenAI API Error:", e)
             return jsonify({"reply": "Error calling OpenAI API for step edit", "sequence": []}), 500
         ai_response = response.choices[0].message.content.strip()
-        
         if "clarify" in ai_response.lower():
             clar_msg = ChatMessage(user_id=user_id, message=ai_response, sender="ai")
             db.session.add(clar_msg)
@@ -326,11 +324,8 @@ def chat():
             else:
                 new_title = target_step.title
                 final_revision = ai_response
-
-            
             pattern = r"^" + re.escape(target_step.title) + r"[\s:\-]*"
             final_revision = re.sub(pattern, "", final_revision).strip()
-
             target_step.title = new_title
             target_step.content = final_revision
             db.session.add(target_step)
@@ -349,7 +344,6 @@ def chat():
         if active_sequence:
             db.session.delete(active_sequence)
             db.session.commit()
-
         db_history = load_db_conversation(user_id)
         try:
             response = client.chat.completions.create(
@@ -408,7 +402,6 @@ def chat():
     else:
         return jsonify({"reply": "Unable to classify request. Please try again.", "sequence": []})
 
-
 @app.route("/api/load", methods=["GET"])
 def load_history():
     user_id = request.args.get("user_id")
@@ -434,7 +427,6 @@ def load_history():
     print(f"Loaded history for user {user_id}: {len(chat_history)} messages, {len(sequences_data)} sequences")
     return jsonify({"chat_history": chat_history, "sequences": sequences_data})
 
-
 @app.route("/api/delete_history", methods=["DELETE"])
 def delete_history():
     user_id = request.args.get("user_id")
@@ -446,7 +438,6 @@ def delete_history():
         db.session.delete(seq)
     db.session.commit()
     return jsonify({"message": "History deleted"}), 200
-
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
